@@ -1,54 +1,55 @@
-version: "3.8"
+version: '3.7'
 
 services:
-
-  # ====================================
-  # 1) Orion Context Broker
-  # ====================================
-  orion:
-    image: fiware/orion
-    container_name: orion
-    restart: always
-    depends_on:
-      - mongo-db
-    ports:
-      - "1026:1026"
-    command: -dbhost mongo-db -logLevel DEBUG
-
-  # ====================================
-  # 2) MongoDB principal (Orion)
-  # ====================================
-  mongo-db:
-    image: mongo:4.4
-    container_name: mongo-db
-    restart: always
-    ports:
-      - "27017:27017"   # apenas o Mongo principal é exposto
-    volumes:
-      - mongo-db:/data/db
-
-  # ====================================
-  # 3) MongoDB Histórico (STH)
-  # ====================================
+  # MongoDB HISTÓRICO (com autenticação) - usado pelo STH Comet
   mongo-db-historical:
     image: mongo:4.4
-    container_name: mongo-db-historical
+    container_name: fiware-mongo-historical
     restart: always
+    hostname: mongo-db-historical
     environment:
       - MONGO_INITDB_ROOT_USERNAME=admin
       - MONGO_INITDB_ROOT_PASSWORD=admin123
-      - MONGO_INITDB_DATABASE=admin
-    # ⚠ sem ports: para evitar conflito na 27017 externa
+    command: ["mongod", "--nojournal", "--auth"]
+    ports:
+      - "27017:27017"  # <-- Exposto externamente, conforme solicitado
     volumes:
-      - mongo-db-historical:/data/db
+      - mongo-historical-data:/data/db
 
-  # ====================================
-  # 4) STH-Comet – Histórico NGSI
-  # ====================================
+  # MongoDB INTERNO (sem autenticação) - usado pelo Orion e IoT Agent
+  mongo-db-internal:
+    image: mongo:4.4
+    container_name: fiware-mongo-internal
+    restart: always
+    hostname: mongo-db-internal
+    command: ["mongod", "--nojournal"]
+    # sem porta mapeada para o host (internal only)
+    volumes:
+      - mongo-internal-data:/data/db
+
+  # Orion – Context Broker (usando mongo-db-historical com auth)
+  orion:
+    image: fiware/orion:3.11.0
+    restart: always
+    container_name: fiware-orion
+    hostname: orion
+    depends_on:
+      - mongo-db-historical
+    ports:
+      - "1026:1026"
+    command: >
+      -dbhost mongo-db-historical
+      -dbuser admin
+      -dbpwd admin123
+      -dbAuthDb admin
+      -corsOrigin __ALL
+      -corsMaxAge 600
+
+  # STH Comet – Armazena dados históricos (usando mongo-db-historical, com auth)
   fiware-sth-comet:
     image: telefonicaiot/fiware-sth-comet
-    container_name: fiware-sth-comet
     restart: always
+    container_name: fiware-sth-comet
     hostname: sth-comet
     depends_on:
       - mongo-db-historical
@@ -57,20 +58,61 @@ services:
     environment:
       - STH_HOST=0.0.0.0
       - STH_PORT=8666
-
-      # Prefixo dos bancos criados
       - DB_PREFIX=sth_
-
-      # Aponta para o Mongo Histórico via rede interna docker
       - DB_URI=mongo-db-historical:27017
-
-      # Autenticação
       - DB_USERNAME=admin
       - DB_PASSWORD=admin123
       - DB_AUTH_SOURCE=admin
-
       - LOGOPS_LEVEL=DEBUG
 
+  # MQTT Broker – Mosquitto
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    restart: always
+    container_name: fiware-mosquitto
+    hostname: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+
+  # IoT Agent – UltraLight (MQTT)
+  iot-agent:
+    image: quay.io/fiware/iotagent-ul:latest
+    restart: always
+    container_name: fiware-iot-agent
+    hostname: iot-agent
+    depends_on:
+      - mongo-db-internal
+      - mosquitto
+    expose:
+      - "4041"
+    ports:
+      - "4041:4041"
+    environment:
+      # Conexão ao Orion
+      - IOTA_CB_HOST=orion
+      - IOTA_CB_PORT=1026
+      - IOTA_CB_NGSI_VERSION=v2
+
+      # Porta Northbound do IoT Agent
+      - IOTA_NORTH_PORT=4041
+
+      # Registro no Mongo (sem auth, interno)
+      - IOTA_MONGO_HOST=mongo-db-internal
+      - IOTA_MONGO_PORT=27017
+
+      # MQTT
+      - IOTA_MQTT_HOST=mosquitto
+      - IOTA_MQTT_PORT=1883
+
+      # Outras opções
+      - IOTA_LOG_LEVEL=DEBUG
+      - IOTA_TIMESTAMP=true
+      - IOTA_AUTOCAST=true
+      - IOTA_PROVIDER_URL=http://iot-agent:4041
+
 volumes:
-  mongo-db:
-  mongo-db-historical:
+  mongo-historical-data:
+  mongo-internal-data:
